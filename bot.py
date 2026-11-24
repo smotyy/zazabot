@@ -30,6 +30,7 @@ except ImportError:
 BRAND = "Zaza Scripts"
 COLOR = discord.Colour(0x10B981)
 
+# Channels, categories and roles can be given as an ID or as a name.
 TICKET_CATEGORY = "1574917466134675577"  # category where ticket channels are created
 LOG_CHANNEL = "1574917555834069042"  # channel that receives logs and transcripts
 REVIEWS_CHANNEL = "1574188434619113544"
@@ -157,28 +158,30 @@ def add_field(modal: discord.ui.Modal, label: str, **options) -> discord.ui.Text
     return text_input
 
 
-def same_name(a: str, b: str) -> bool:
-    return a.casefold() == b.casefold()
+def matches(item: discord.abc.Snowflake, ref: int | str) -> bool:
+    """True when a channel or role is the one `ref` points to (an ID or a name)."""
+    ref = str(ref).strip()
+    return str(item.id) == ref or getattr(item, "name", "").casefold() == ref.casefold()
 
 
 def find_category(guild: discord.Guild) -> discord.CategoryChannel | None:
-    return next((c for c in guild.categories if same_name(c.name, TICKET_CATEGORY)), None)
+    return next((c for c in guild.categories if matches(c, TICKET_CATEGORY)), None)
 
 
-def find_text_channel(guild: discord.Guild, name: str) -> discord.TextChannel | None:
-    return next((c for c in guild.text_channels if same_name(c.name, name)), None)
+def find_text_channel(guild: discord.Guild, ref: int | str) -> discord.TextChannel | None:
+    return next((c for c in guild.text_channels if matches(c, ref)), None)
 
 
-def find_role(guild: discord.Guild, name: str) -> discord.Role | None:
-    return next((r for r in guild.roles if same_name(r.name, name)), None)
+def find_role(guild: discord.Guild, ref: int | str) -> discord.Role | None:
+    return next((r for r in guild.roles if matches(r, ref)), None)
 
 
-def has_role(member: discord.Member, name: str) -> bool:
-    return any(same_name(r.name, name) for r in member.roles)
+def has_role(member: discord.Member, ref: int | str) -> bool:
+    return any(matches(r, ref) for r in member.roles)
 
 
 def staff_roles(guild: discord.Guild) -> list[discord.Role]:
-    return [r for r in guild.roles if any(same_name(r.name, n) for n in STAFF_ROLES)]
+    return [r for r in guild.roles if any(matches(r, ref) for ref in STAFF_ROLES)]
 
 
 def is_staff(member: discord.Member) -> bool:
@@ -296,7 +299,7 @@ async def create_ticket(interaction: discord.Interaction, ticket_type: TicketTyp
 
     category = find_category(guild)
     if category is None:
-        await reply(interaction, f"The '{TICKET_CATEGORY}' category was not found. Please contact the owner.")
+        await reply(interaction, "The ticket category was not found. Please contact the owner.")
         return
     if existing := find_open_ticket(guild, user.id):
         await reply(interaction, f"You already have an open ticket: {existing.mention}")
@@ -432,7 +435,7 @@ def build_post_embed(title: str, content: str, price: str = "", image: str = "")
 
 
 def section_for_channel(channel: discord.abc.GuildChannel) -> Section | None:
-    return next((s for s in SECTIONS.values() if same_name(s.channel, channel.name)), None)
+    return next((s for s in SECTIONS.values() if matches(channel, s.channel)), None)
 
 
 class PostView(SafeView):
@@ -540,7 +543,7 @@ class ReviewModal(SafeModal):
             return
         channel = find_text_channel(interaction.guild, REVIEWS_CHANNEL)
         if channel is None:
-            await reply(interaction, f"The #{REVIEWS_CHANNEL} channel was not found.")
+            await reply(interaction, "The reviews channel was not found.")
             return
 
         embed = make_embed("\u2605" * stars + "\u2606" * (5 - stars), str(self.comment))
@@ -717,6 +720,8 @@ class ZazaBot(commands.Bot):
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (%s)", self.user, self.user.id)
+        for guild in self.guilds:
+            check_setup(guild)
 
     @tasks.loop(seconds=15)
     async def check_giveaways(self) -> None:
@@ -729,6 +734,20 @@ class ZazaBot(commands.Bot):
     @check_giveaways.before_loop
     async def wait_until_ready_first(self) -> None:
         await self.wait_until_ready()
+
+
+def check_setup(guild: discord.Guild) -> None:
+    """Log a warning for every channel or role from the config that does not exist."""
+    expected = {
+        "ticket category": find_category(guild),
+        "log channel": find_text_channel(guild, LOG_CHANNEL),
+        "reviews channel": find_text_channel(guild, REVIEWS_CHANNEL),
+        "customer role": find_role(guild, CUSTOMER_ROLE),
+        "staff roles": staff_roles(guild),
+    }
+    for label, found in expected.items():
+        if not found:
+            log.warning("%s: %s not found. Check the config at the top of bot.py.", guild.name, label)
 
 
 bot = ZazaBot()
@@ -805,7 +824,7 @@ customer = app_commands.Group(
 async def set_customer_role(interaction: discord.Interaction, member: discord.Member, *, give: bool) -> None:
     role = find_role(interaction.guild, CUSTOMER_ROLE)
     if role is None:
-        await reply(interaction, f"The '{CUSTOMER_ROLE}' role was not found.")
+        await reply(interaction, "The Customer role was not found.")
         return
     try:
         if give:
