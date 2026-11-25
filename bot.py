@@ -108,6 +108,7 @@ SECTIONS: dict[str, Section] = {
     s.key: s
     for s in (
         Section("rules", "rules"),
+        Section("tos", "tos"),
         Section("faq", "faq"),
         Section("products", "products", has_price=True, button="Buy", ticket="purchase"),
         Section("services", "services", has_price=True),
