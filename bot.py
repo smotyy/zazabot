@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,7 @@ from pathlib import Path
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 TOKEN_FROM_HOST = bool(os.getenv("DISCORD_TOKEN"))  # set as a variable on the host, not in a .env file
 
@@ -38,6 +40,7 @@ LOG_CHANNEL = "1574917555834069042"  # channel that receives logs and transcript
 REVIEWS_CHANNEL = "1574188434619113544"
 STAFF_ROLES = ("1574187317009186887", "1574187355114311792")  # roles that can see every ticket
 CUSTOMER_ROLE = "1574187393110507520"
+MEMBER_ROLE = "1574187422156333228"  # given after the captcha is solved (use the role ID or name)
 CLOSE_DELAY_SECONDS = 5
 
 MIN_GIVEAWAY = timedelta(seconds=10)
@@ -722,6 +725,109 @@ async def find_giveaway(interaction: discord.Interaction, text: str) -> Giveaway
 
 
 # ============================================================================
+# Verification (captcha)
+# ============================================================================
+CAPTCHA_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # no 0/O or 1/I, they look alike
+CAPTCHA_LENGTH = 5
+
+
+def make_captcha(code: str) -> io.BytesIO:
+    """Render the code as a distorted image with noise, so bots cannot read it easily."""
+    width, height = 340, 120
+    image = Image.new("RGB", (width, height), (22, 30, 27))
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default(size=68)
+
+    def random_color(low: int, high: int) -> tuple[int, int, int]:
+        return tuple(random.randint(low, high) for _ in range(3))
+
+    for _ in range(10):  # noise behind the letters
+        draw.line(
+            [(random.randint(0, width), random.randint(0, height)), (random.randint(0, width), random.randint(0, height))],
+            fill=random_color(40, 90),
+            width=random.randint(1, 3),
+        )
+    x = 18
+    for char in code:  # every letter is rotated and placed at a slightly different height
+        layer = Image.new("RGBA", (90, 100), (0, 0, 0, 0))
+        ImageDraw.Draw(layer).text((14, 4), char, font=font, fill=(*random_color(190, 255), 255))
+        layer = layer.rotate(random.uniform(-20, 20), resample=Image.Resampling.BICUBIC, expand=True)
+        image.paste(layer, (x, random.randint(0, 18)), layer)
+        x += 60
+    for _ in range(5):  # lines on top of the letters
+        draw.line(
+            [(0, random.randint(10, height - 10)), (width, random.randint(10, height - 10))],
+            fill=random_color(70, 130),
+            width=2,
+        )
+    for _ in range(250):
+        draw.point((random.randint(0, width - 1), random.randint(0, height - 1)), fill=random_color(80, 220))
+
+    buffer = io.BytesIO()
+    image.filter(ImageFilter.SMOOTH).save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+
+async def grant_member_role(interaction: discord.Interaction) -> None:
+    role = find_role(interaction.guild, MEMBER_ROLE)
+    if role is None:
+        await reply(interaction, "The Member role was not found. Please contact the owner.")
+        return
+    try:
+        await interaction.user.add_roles(role, reason="Passed the captcha verification")
+    except discord.Forbidden:
+        await reply(interaction, "I can't assign the Member role. Please contact the owner.")
+        return
+    await reply(interaction, "You are verified. Welcome!")
+
+
+class CaptchaModal(SafeModal):
+    def __init__(self, code: str) -> None:
+        super().__init__(title="Verification")
+        self.code = code
+        self.answer = add_field(
+            self, "Type the code from the image", max_length=CAPTCHA_LENGTH + 2, placeholder="ABCDE"
+        )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if str(self.answer).strip().upper() == self.code:
+            await grant_member_role(interaction)
+        else:
+            await reply(interaction, "Wrong code. Press Verify again to get a new captcha.")
+
+
+class CaptchaView(SafeView):
+    """Shown privately next to the captcha image. It only lives for this one attempt."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(timeout=300)
+        self.code = code
+
+    @discord.ui.button(label="Enter code", style=discord.ButtonStyle.success)
+    async def enter(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(CaptchaModal(self.code))
+
+
+class VerifyPanel(SafeView):
+    """The public verification panel."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Verify", style=discord.ButtonStyle.success, custom_id="zaza:verify:start")
+    async def verify(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if has_role(interaction.user, MEMBER_ROLE):
+            await reply(interaction, "You are already verified.")
+            return
+        code = "".join(secrets.choice(CAPTCHA_ALPHABET) for _ in range(CAPTCHA_LENGTH))
+        embed = make_embed("Captcha", "Type the code shown in the image.")
+        embed.set_image(url="attachment://captcha.png")
+        file = discord.File(make_captcha(code), filename="captcha.png")
+        await interaction.response.send_message(embed=embed, file=file, view=CaptchaView(code), ephemeral=True)
+
+
+# ============================================================================
 # Bot
 # ============================================================================
 class ZazaBot(commands.Bot):
@@ -739,6 +845,7 @@ class ZazaBot(commands.Bot):
         self.add_view(TicketPanel())
         self.add_view(TicketControls())
         self.add_view(GiveawayView())
+        self.add_view(VerifyPanel())
         for section in SECTIONS.values():
             if section.button:
                 self.add_view(PostView(section))
@@ -747,6 +854,9 @@ class ZazaBot(commands.Bot):
             guild = discord.Object(id=GUILD_ID)
             self.tree.copy_global_to(guild=guild)
             await self.tree.sync(guild=guild)
+            # Remove global copies made by earlier runs without GUILD_ID, otherwise every command shows twice.
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
         else:
             await self.tree.sync()
         self.check_giveaways.start()
@@ -776,6 +886,7 @@ def check_setup(guild: discord.Guild) -> None:
         "log channel": find_text_channel(guild, LOG_CHANNEL),
         "reviews channel": find_text_channel(guild, REVIEWS_CHANNEL),
         "customer role": find_role(guild, CUSTOMER_ROLE),
+        "member role": find_role(guild, MEMBER_ROLE),
         "staff roles": staff_roles(guild),
     }
     for label, found in expected.items():
@@ -812,6 +923,18 @@ async def panel(interaction: discord.Interaction) -> None:
     )
     await interaction.channel.send(embed=embed, view=TicketPanel())
     await reply(interaction, "Panel posted.")
+
+
+@bot.tree.command(name="verify", description="Post the verification panel in this channel")
+@admin_only
+@app_commands.guild_only()
+async def verify_panel(interaction: discord.Interaction) -> None:
+    embed = make_embed(
+        "Verification",
+        f"Welcome to **{BRAND}**. Press the button below and solve the captcha to get access to the server.",
+    )
+    await interaction.channel.send(embed=embed, view=VerifyPanel())
+    await reply(interaction, "Verification panel posted.")
 
 
 @bot.tree.command(name="post", description="Post an embed in the rules, faq, products, services... channels")
