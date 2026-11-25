@@ -16,6 +16,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+TOKEN_FROM_HOST = bool(os.getenv("DISCORD_TOKEN"))  # set as a variable on the host, not in a .env file
+
 try:  # optional: load a local .env file when python-dotenv is installed
     from dotenv import load_dotenv
 
@@ -41,9 +43,18 @@ CLOSE_DELAY_SECONDS = 5
 MIN_GIVEAWAY = timedelta(seconds=10)
 MAX_GIVEAWAY = timedelta(days=30)
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+
+
+def clean_token(value: str | None) -> str:
+    """Remove spaces, quotes and an accidental 'Bot ' prefix around the pasted token."""
+    token = (value or "").strip().strip("\"'").strip()
+    return token.removeprefix("Bot ").strip()
+
+
+TOKEN = clean_token(os.getenv("DISCORD_TOKEN"))
 GUILD_ID = int(os.getenv("GUILD_ID") or 0)
 DATA_FILE = Path(__file__).with_name("data.json")
+BANNER_FILE = Path(__file__).with_name("banner.png")  # posted by /img when no image is given
 
 
 @dataclass(frozen=True)
@@ -79,6 +90,9 @@ TICKET_TYPES: dict[str, TicketType] = {
 }
 
 
+PRICE_LABELS = ("Price", "Prices start at")  # the choices shown when writing a post
+
+
 @dataclass(frozen=True)
 class Section:
     """A channel that /post can write to."""
@@ -96,7 +110,7 @@ SECTIONS: dict[str, Section] = {
         Section("rules", "rules"),
         Section("faq", "faq"),
         Section("products", "products", has_price=True, button="Buy", ticket="purchase"),
-        Section("services", "services", has_price=True, button="Order", ticket="custom"),
+        Section("services", "services", has_price=True),
         Section("pricing", "pricing", has_price=True),
         Section("showcase", "showcase"),
         Section("changelog", "changelog"),
@@ -156,6 +170,13 @@ def add_field(modal: discord.ui.Modal, label: str, **options) -> discord.ui.Text
     text_input = discord.ui.TextInput(**options)
     modal.add_item(discord.ui.Label(text=label, component=text_input))
     return text_input
+
+
+def add_select(modal: discord.ui.Modal, label: str, choices: tuple[str, ...], selected: str) -> discord.ui.Select:
+    """Add a labelled drop-down to a modal and return it."""
+    select = discord.ui.Select(options=[discord.SelectOption(label=c, default=c == selected) for c in choices])
+    modal.add_item(discord.ui.Label(text=label, component=select))
+    return select
 
 
 def matches(item: discord.abc.Snowflake, ref: int | str) -> bool:
@@ -425,10 +446,12 @@ class TicketPanel(SafeView):
 # ============================================================================
 # Posts: rules, faq, products, services, pricing, showcase, changelog
 # ============================================================================
-def build_post_embed(title: str, content: str, price: str = "", image: str = "") -> discord.Embed:
+def build_post_embed(
+    title: str, content: str, price: str = "", image: str = "", price_label: str = PRICE_LABELS[0]
+) -> discord.Embed:
     embed = make_embed(title, content)
     if price:
-        embed.add_field(name="Price", value=price, inline=False)
+        embed.add_field(name=price_label, value=price, inline=False)
     if image.startswith(("http://", "https://")):
         embed.set_image(url=image)
     return embed
@@ -465,7 +488,7 @@ class PostModal(SafeModal):
         self.message = message
 
         current = message.embeds[0] if message and message.embeds else None
-        price = next((f.value for f in current.fields if f.name == "Price"), None) if current else None
+        price_field = next((f for f in current.fields if f.name in PRICE_LABELS), None) if current else None
 
         self.name_input = add_field(self, "Title", max_length=256, default=current.title if current else None)
         self.body_input = add_field(
@@ -475,11 +498,19 @@ class PostModal(SafeModal):
             max_length=4000,
             default=current.description if current else None,
         )
-        self.price_input = (
-            add_field(self, "Price", max_length=100, required=False, placeholder="For example 15 EUR", default=price)
-            if section.has_price
-            else None
-        )
+        self.price_label: discord.ui.Select | None = None
+        self.price_input: discord.ui.TextInput | None = None
+        if section.has_price:
+            selected = price_field.name if price_field else PRICE_LABELS[0]
+            self.price_label = add_select(self, "Price type", PRICE_LABELS, selected)
+            self.price_input = add_field(
+                self,
+                "Price",
+                max_length=100,
+                required=False,
+                placeholder="For example 15 EUR",
+                default=price_field.value if price_field else None,
+            )
         self.image_input = add_field(
             self,
             "Image link (optional)",
@@ -494,9 +525,10 @@ class PostModal(SafeModal):
             str(self.body_input),
             str(self.price_input) if self.price_input is not None else "",
             str(self.image_input),
+            (self.price_label.values or [PRICE_LABELS[0]])[0] if self.price_label is not None else PRICE_LABELS[0],
         )
         if self.message:
-            await self.message.edit(embed=embed)
+            await self.message.edit(embed=embed, view=PostView(self.section) if self.section.button else None)
             await reply(interaction, "Post updated.")
             return
 
@@ -812,6 +844,31 @@ async def review(interaction: discord.Interaction) -> None:
     await interaction.response.send_modal(ReviewModal())
 
 
+@bot.tree.command(name="img", description="Post the banner, or an image you upload, in a channel")
+@app_commands.describe(
+    image="Image to post. Leave empty to post the default banner (banner.png)",
+    channel="Where to post it. Default: this channel",
+)
+@admin_only
+@app_commands.guild_only()
+async def img(
+    interaction: discord.Interaction,
+    image: discord.Attachment | None = None,
+    channel: discord.TextChannel | None = None,
+) -> None:
+    if image is None and not BANNER_FILE.exists():
+        await reply(interaction, "No image given, and banner.png was not found next to bot.py.")
+        return
+    if image is not None and not (image.content_type or "").startswith("image/"):
+        await reply(interaction, "That file is not an image.")
+        return
+
+    target = channel or interaction.channel
+    await interaction.response.defer(ephemeral=True)
+    await target.send(file=await image.to_file() if image else discord.File(BANNER_FILE))
+    await interaction.followup.send(f"Image posted in {target.mention}.", ephemeral=True)
+
+
 # ---- Customer role ----------------------------------------------------------
 customer = app_commands.Group(
     name="customer",
@@ -930,11 +987,24 @@ bot.tree.add_command(giveaway_group)
 # ============================================================================
 # Entry point
 # ============================================================================
+def describe_token(token: str) -> str:
+    """Shape of the token, without revealing it. A bot token has 3 parts separated by dots."""
+    return f"{len(token)} characters, {token.count('.') + 1} part(s)"
+
+
 def main() -> None:
     if not TOKEN:
         raise SystemExit("DISCORD_TOKEN is missing. Set it as an environment variable or in a .env file.")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    bot.run(TOKEN, log_handler=None)
+    try:
+        bot.run(TOKEN, log_handler=None)
+    except discord.LoginFailure:
+        source = "host variable" if TOKEN_FROM_HOST else ".env file"
+        raise SystemExit(
+            f"Discord rejected the token ({describe_token(TOKEN)}, read from the {source}). "
+            "A bot token has 3 parts separated by dots. In the Developer Portal open the Bot tab, "
+            "press Reset Token, and set DISCORD_TOKEN again."
+        ) from None
 
 
 if __name__ == "__main__":
