@@ -115,6 +115,7 @@ SECTIONS: dict[str, Section] = {
         Section("faq", "faq"),
         Section("products", "products", has_price=True, button="Buy", ticket="purchase"),
         Section("services", "services", has_price=True),
+        Section("discord-services", "discord-services", has_price=True),  # channel name or ID
         Section("pricing", "pricing", has_price=True),
         Section("showcase", "showcase"),
         Section("changelog", "changelog"),
